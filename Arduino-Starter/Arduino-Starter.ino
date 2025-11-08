@@ -7,110 +7,102 @@
 #error "Team number must be within 1 and 40"
 #endif
 
-void setup()
-{
+// --- Tuning options ---
+const float DEADBAND = 0.05f;   // ignore small stick noise
+const bool  SQUARED  = true;    // square inputs for finer control near center
+const bool  INVERT_LEFT  = true; // flip if your left side runs backwards
+const bool  INVERT_RIGHT = false; // flip if your right side runs backwards
+
+static inline float applyDeadband(float v, float db) {
+  if (fabs(v) < db) return 0.0f;
+  // rescale so full throw still reaches 1.0 after deadband
+  return (v > 0 ? (v - db) : (v + db)) / (1.0f - db);
+}
+
+static inline float shape(float v) {
+  if (!SQUARED) return v;
+  // keep sign, square magnitude (gentler near zero, full power at 1)
+  return (v >= 0 ? 1 : -1) * (v * v);
+}
+
+void setup() {
   Serial.begin(115200);
 }
 
 int temp = 0;
 
-void loop()
-{
-  // Read the four joystick axes
-  // These will be in the range [-1.0, 1.0]
+void loop() {
+  // Read the four joystick axes in [-1.0, 1.0]
   float rightX = RR_axisRX();
   float rightY = RR_axisRY();
-  float leftX = RR_axisLX();
-  float leftY = RR_axisLY();
+  float leftX  = RR_axisLX();
+  float leftY  = RR_axisLY();
 
-  // Arcade-drive scheme
-  // Left Y-axis = throttle
-  // Right X-axis = steering
-  RR_setMotor1(leftY + rightX);
-  RR_setMotor2(leftY - rightX);
+  // ---- TANK DRIVE ----
+  // Left stick Y drives left side; Right stick Y drives right side
+  float leftCmd  = applyDeadband(leftY,  DEADBAND);
+  float rightCmd = applyDeadband(rightY, DEADBAND);
 
-  // Get the button states
-  bool btnA = RR_buttonA();
-  bool btnB = RR_buttonB();
-  bool btnX = RR_buttonX();
-  bool btnY = RR_buttonY();
+  leftCmd  = shape(leftCmd);
+  rightCmd = shape(rightCmd);
+
+  if (INVERT_LEFT)  leftCmd  = -leftCmd;
+  if (INVERT_RIGHT) rightCmd = -rightCmd;
+
+  // Motor1 = left side, Motor2 = right side (same mapping you had before)
+  RR_setMotor1(leftCmd);
+  RR_setMotor2(rightCmd);
+
+  // --- Buttons ---
+  bool btnA  = RR_buttonA();
+  bool btnB  = RR_buttonB();
+  bool btnX  = RR_buttonX();
+  bool btnY  = RR_buttonY();
   bool btnRB = RR_buttonRB();
   bool btnLB = RR_buttonLB();
 
-  // Control motor3 port (unused on base robot) using A/B buttons
-  if (btnA)
-  {
+  // Motor3 via A/B
+  if (btnA) {
     RR_setMotor3(1.0);
-  }
-  else if (btnB)
-  {
+  } else if (btnB) {
     RR_setMotor3(-1.0);
-  }
-  else
-  {
+  } else {
     RR_setMotor3(0.0);
   }
 
-  // Control motor4 port (unused on base robot) using X/Y buttons
-  if (btnX)
-  {
+  // Motor4 via X/Y
+  if (btnX) {
     RR_setMotor4(1.0);
-  }
-  else if (btnY)
-  {
+  } else if (btnY) {
     RR_setMotor4(-1.0);
-  }
-  else
-  {
+  } else {
     RR_setMotor4(0.0);
   }
 
-  // Control servo 1 using the dpad
-  // 6 = left, 2 = right, 0 = up, 4 = down, 8 = center
-  if (RR_dpad() == 6)
-  { // left
-
-    // we can't move a servo less than 0 degrees
-    if (temp > 0)
-      temp -= 10;
-  }
-  else if (RR_dpad() == 2)
-  { // right
-
-    // we can't move a servo past 180 degrees
-    // for continuous rotation, try using a DC motor
-    if (temp < 180)
-      temp += 10;
+  // Servo 1 via dpad
+  if (RR_dpad() == 6) { // left
+    if (temp > 0) temp -= 10;
+  } else if (RR_dpad() == 2) { // right
+    if (temp < 180) temp += 10;
   }
   RR_setServo1(temp);
 
-  // Control servo 2 using the shoulder buttons
-  // This example moves the servo to fixed points
-  // You can change the angles based on your mechanism
-  // (this is great for a mechanism that only has 2 states,
-  //  such as a grabber or hook)
-  if (btnRB)
-  {
+  // Servo 2 via shoulders
+  if (btnRB) {
     RR_setServo2(180);
-  }
-  else if (btnLB)
-  {
+  } else if (btnLB) {
     RR_setServo2(0);
   }
 
-  // we also have RR_setServo3 and RR_setServo4 available
-
-  // read the ultrasonic sensors
-
+  // --- Sensors / Telemetry ---
   Serial.print("Ultrasonic=");
   Serial.print(RR_getUltrasonic());
   Serial.print(" ;; ");
-  int sensors[6];
 
+  int sensors[6];
   Serial.print("Line sensors=");
   RR_getLineSensors(sensors);
-  for (int i = 0; i < 6; ++i)
-  {
+  for (int i = 0; i < 6; ++i) {
     Serial.print(sensors[i]);
     Serial.print(" ");
   }
@@ -120,9 +112,8 @@ void loop()
   Serial.print(btnY ? 1 : 0);
   Serial.println();
 
-  // This is important - it sleeps for 0.02 seconds (= 50 times / second)
-  // Running the code too fast will overwhelm the microcontroller and peripherals
-  delay(20);
+ 
+  delay(1);
 }
 
 // vim: tabstop=2 shiftwidth=2 expandtab

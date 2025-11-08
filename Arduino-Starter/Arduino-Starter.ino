@@ -15,11 +15,10 @@ const bool  INVERT_LEFT  = true;
 const bool  INVERT_RIGHT = false;
 
 // ========================= Arm / servo calibration =========================
-static const int SHOULDER_SERVO_ID = 1; // RR_setServo1 -> shoulder
-static const int ELBOW_SERVO_ID    = 2; // RR_setServo2 -> elbow
-static const int BTN_SERVO_ID      = 3; // RR_setServo3 -> button servo (unique channel)
+// RR_setServo1 -> shoulder
+// RR_setServo2 -> elbow
+// RR_setServo3 -> button servo
 
-// Offsets and reversals for shoulder/elbow (button servo uses raw 0/180)
 float SHOULDER_OFFSET_DEG = 0.0f;
 bool  SHOULDER_REVERSED   = false;
 
@@ -74,21 +73,9 @@ static inline int stepToward(int cur, int target, int step) {
   return cur;
 }
 
-// Low-level writes respecting channel mapping
-static inline void writeShoulder(int cmd) {
-  if (SHOULDER_SERVO_ID == 1) RR_setServo1(cmd);
-  else                        RR_setServo2(cmd);
-}
-static inline void writeElbow(int cmd) {
-  if (ELBOW_SERVO_ID == 2)    RR_setServo2(cmd);
-  else                        RR_setServo1(cmd);
-}
-static inline void writeButtonServo(int cmd) {
-  // Route to the selected button-servo channel
-  if (BTN_SERVO_ID == 1) RR_setServo1(cmd);
-  else if (BTN_SERVO_ID == 2) RR_setServo2(cmd);
-  else /* BTN_SERVO_ID == 3 */ RR_setServo3(cmd);
-}
+static inline void writeShoulder(int cmd) { RR_setServo1(cmd); }
+static inline void writeElbow(int cmd)    { RR_setServo2(cmd); }
+static inline void writeButtonServo(int cmd) { RR_setServo3(cmd); }
 
 // Non-blocking arm servo slewing: call once per loop
 void serviceServosSlew() {
@@ -160,86 +147,242 @@ void setState(ArmState s) {
 // ========================= Intake/Outtake motor (Motor3) =========================
 const bool  AUX_REVERSED   = false; // flip if directions are backwards
 const float AUX_BASE_SPEED = 1.0f;
-
 static inline float auxIntakeSpeed()  { return AUX_REVERSED ? -AUX_BASE_SPEED :  AUX_BASE_SPEED; }
 static inline float auxOuttakeSpeed() { return AUX_REVERSED ?  AUX_BASE_SPEED : -AUX_BASE_SPEED; }
 
 // ========================= Button Servo Toggle (LB) =========================
-// LB toggles the button servo 0° <-> 180° (with edge detection)
 bool btnServoHigh = false;   // false = 0°, true = 180°
-int  btnServoCmd  = 0;       // last commanded to the button servo
+int  btnServoCmd  = 0;
+bool autoButtonPressed = false;  // track if button was pressed in auto mode
+
+// ========================= Mode handling =========================
+enum RunMode { MODE_STATIONARY, MODE_AUTO, MODE_TELEOP };
+RunMode mode = MODE_STATIONARY;
+unsigned long autoStartMs = 0;
+int autoStep = 0;
+
+// --- autonomous step timing (edit to taste) ---
+const unsigned long T_INTAKE_MS   = 1500;  // intake window
+const unsigned long T_DRIVE_MS    = 2000;  // drive forward
+const unsigned long T_SCORE_MS    = 1000;  // settle in score pose
+
+// Start teleop when RT is pressed
+// Automatically uses RR_buttonRT() from Library.ino
+static inline bool teleopStartRequested() {
+  return RR_buttonRT();
+}
+
+// Stop drivetrain + intake safely
+static inline void stopAllMotion() {
+  RR_setMotor1(0.0f);
+  RR_setMotor2(0.0f);
+  RR_setMotor3(0.0f);
+}
+
+// ---------- AUTO line-follow params ----------
+const float  AUTO_BASE_SPEED   = 0.50f;  // forward speed (0..1)
+const float  AUTO_TURN_KP      = 0.35f;  // steering gain (tweak on carpet)
+const int    STOP_DIST_CM      = 20;     // stop when obstacle closer than this
+const int    LINE_N            = 6;      // RR_getLineSensors() returns 6 values in this project
+
+// Map sensor indices to positions (left -> negative, right -> positive).
+// Spread wider for a stronger steering signal.
+const int8_t LINE_POS[LINE_N] = { -5, -3, -1, 1, 3, 5 };
+
+// Compute line error in ~[-1, +1]. Positive = line is to the RIGHT.
+float computeLineError(bool &haveLine) {
+  int sensors[LINE_N];
+  RR_getLineSensors(sensors);
+
+  // Treat any nonzero as "on line" (works with digital or thresholded sensors).
+  long wsum = 0;       // weighted sum of hits
+  long cnt  = 0;       // number of active sensors
+  for (int i = 0; i < LINE_N; ++i) {
+    if (sensors[i] != 0) {
+      wsum += LINE_POS[i];
+      cnt  += 1;
+    }
+  }
+
+  haveLine = (cnt > 0);
+
+  static float lastErr = 0.0f;
+  if (!haveLine) {
+    // If we lost the line, keep steering the last known way a bit.
+    return lastErr;
+  }
+
+  float avgPos = (float)wsum / (float)cnt;  // roughly in [-5..+5]
+  float err = avgPos / 5.0f;                // normalize to about [-1..+1]
+  lastErr = err;
+  return err;
+}
+
+// One step of autonomous line following. Returns true when we decided to stop.
+bool autoLineFollowStep() {
+  // 1) Stop if obstacle is close
+  int dist = RR_getUltrasonic();     // assumed centimeters
+  if (dist > 0 && dist <= STOP_DIST_CM) {
+    RR_setMotor1(0.0f);
+    RR_setMotor2(0.0f);
+    RR_setMotor3(0.0f);
+    return true;
+  }
+
+  // 2) Compute line error and steer
+  bool haveLine = false;
+  float err = computeLineError(haveLine);
+
+  // Base forward speed; steer by differential
+  float left  = AUTO_BASE_SPEED + (AUTO_TURN_KP * err);  // err>0 (right) -> steer right (left faster)
+  float right = AUTO_BASE_SPEED - (AUTO_TURN_KP * err);
+
+  // Safety clamp
+  if (left  >  1.0f) left  =  1.0f;
+  if (right >  1.0f) right =  1.0f;
+  if (left  < -1.0f) left  = -1.0f;
+  if (right < -1.0f) right = -1.0f;
+
+  // Apply motor inversion settings (same as teleop)
+  if (INVERT_LEFT)  left  = -left;
+  if (INVERT_RIGHT) right = -right;
+
+  RR_setMotor1(left);
+  RR_setMotor2(right);
+
+  // Optional: keep the arm in a known pose during auto
+  setState(IDLE);  // or INTAKE/SCORE if you want
+
+  return false; // keep going
+}
 
 // ========================= Setup / Loop =========================
 void setup() {
   Serial.begin(115200);
-  applyCurrentPose();           // set initial arm targets & write once
+  
+  // Initialize mode to STATIONARY - robot waits for LT or RT
+  mode = MODE_STATIONARY;
+  
+  // Initialize arm pose (idle)
+  setState(IDLE);
+  applyCurrentPose(); // set initial targets & write once
 
   // Initialize button servo to 0°
   btnServoHigh = false;
   btnServoCmd  = 0;
   writeButtonServo(btnServoCmd);
+  autoButtonPressed = false;  // Reset button press flag
+
+  // Stop all motion - ensure robot is stationary
+  stopAllMotion();
+
+  autoStartMs = millis();
+  autoStep = 0;
 }
 
 void loop() {
-  // -------- Tank drive --------
-  float leftY  = RR_axisLY();
-  float rightY = RR_axisRY();
-
-  float leftCmd  = applyDeadband(leftY,  DEADBAND);
-  float rightCmd = applyDeadband(rightY, DEADBAND);
-
-  leftCmd  = shape(leftCmd);
-  rightCmd = shape(rightCmd);
-
-  if (INVERT_LEFT)  leftCmd  = -leftCmd;
-  if (INVERT_RIGHT) rightCmd = -rightCmd;
-
-  RR_setMotor1(leftCmd);   // left side
-  RR_setMotor2(rightCmd);  // right side
-
-  // -------- Buttons --------
-  bool btnA  = RR_buttonA();   // SCORE
-  bool btnB  = RR_buttonB();   // INTAKE
-  bool btnX  = RR_buttonX();   // BUTTON
-  bool btnY  = RR_buttonY();   // IDLE
-  bool btnRB = RR_buttonRB();  // OUTTAKE
-  bool btnLB = RR_buttonLB();  // TOGGLE button servo
-
-  // Arm state selection (targets change; slewer handles motion)
-  if (btnA) setState(SCORE);
-  if (btnB) { setState(INTAKE); RR_setMotor3(auxIntakeSpeed()); } // intake while B held
-  if (btnX) setState(BUTTON);
-  if (btnY) setState(IDLE);
-
-  // Outtake (Motor3) on RB. Stop when neither RB nor B is held.
-  if (btnRB) {
-    RR_setMotor3(auxOuttakeSpeed());
-  } else if (!btnB) {
-    RR_setMotor3(0.0f);
-  }
-
-  // ---- LB: toggle the button servo between 0 and 180 on each press ----
-  static bool lbPrev = false;
-  if (btnLB && !lbPrev) {
-    btnServoHigh = !btnServoHigh;                 // flip state
-    btnServoCmd  = btnServoHigh ? 180 : 0;        // target angle
-    writeButtonServo(btnServoCmd);                // immediate write (no slew)
-  }
-  lbPrev = btnLB;
-
-  // -------- Slew the arm servos smoothly (non-blocking) --------
+  // --------- GLOBAL: smooth the arm servos ---------
   serviceServosSlew();
 
-  // -------- Telemetry --------
-  Serial.print("Ultrasonic=");
-  Serial.print(RR_getUltrasonic());
-  Serial.print(" ;; Line=");
+  // --------- Check for mode switching ---------
+  if (mode == MODE_STATIONARY) {
+    // Robot is stationary - wait for LT or RT to start a mode
+    stopAllMotion();  // Ensure all motion is stopped
+    
+    if (RR_buttonLT()) {
+      // LT pressed: start autonomous mode
+      mode = MODE_AUTO;
+      stopAllMotion();
+      autoButtonPressed = false;  // Reset button press flag
+      Serial.println("LT pressed - Starting AUTONOMOUS mode");
+    } else if (teleopStartRequested()) {
+      // RT pressed: start teleop mode
+      mode = MODE_TELEOP;
+      stopAllMotion();
+      autoButtonPressed = false;  // Reset button press flag
+      Serial.println("RT pressed - Starting TELEOP mode");
+    }
+  } else if (mode == MODE_AUTO && teleopStartRequested()) {
+    // RT pressed during autonomous: switch to teleop
+    mode = MODE_TELEOP;
+    stopAllMotion();
+    autoButtonPressed = false;  // Reset button press flag
+    Serial.println("RT pressed - Switching from AUTO to TELEOP");
+  }
 
-  int sensors[6];
-  RR_getLineSensors(sensors);
-  for (int i = 0; i < 6; ++i) {
-    Serial.print(sensors[i]);
-    Serial.print(" ");
+  // --------- MODE LOGIC ---------
+  if (mode == MODE_STATIONARY) {
+    // Stationary mode: stop all motion, wait for LT or RT
+    stopAllMotion();
+  } else if (mode == MODE_AUTO) {
+    // Follow the tape until ultrasonic says we're close enough, then stop & press button.
+    bool shouldStop = autoLineFollowStep();
+    if (shouldStop) {
+      // Press the button when we arrive (only once)
+      if (!autoButtonPressed) {
+        setState(BUTTON);           // Move arm to button position
+        btnServoHigh = true;        // Press button (180°)
+        btnServoCmd  = 180;
+        writeButtonServo(btnServoCmd);
+        autoButtonPressed = true;   // Mark as pressed
+      }
+      RR_setMotor3(0.0f);        // stop intake/outtake
+      // stay in AUTO; driver can press RT/RB to enter teleop at any time
+    }
+  } else {
+    // =========== TELEOP ===========
+    // -------- Tank drive --------
+    float leftY  = RR_axisLY();
+    float rightY = RR_axisRY();
+
+    float leftCmd  = applyDeadband(leftY,  DEADBAND);
+    float rightCmd = applyDeadband(rightY, DEADBAND);
+    leftCmd  = shape(leftCmd);
+    rightCmd = shape(rightCmd);
+    if (INVERT_LEFT)  leftCmd  = -leftCmd;
+    if (INVERT_RIGHT) rightCmd = -rightCmd;
+    RR_setMotor1(leftCmd);   // left side
+    RR_setMotor2(rightCmd);  // right side
+
+    // -------- Buttons --------
+    bool btnA  = RR_buttonA();   // SCORE
+    bool btnB  = RR_buttonB();   // INTAKE
+    bool btnX  = RR_buttonX();   // BUTTON
+    bool btnY  = RR_buttonY();   // IDLE
+    bool btnRB = RR_buttonRB();  // OUTTAKE
+    bool btnLB = RR_buttonLB();  // TOGGLE button servo
+
+    // Arm state selection (targets change; slewer handles motion)
+    if (btnA) setState(SCORE);
+    if (btnB) { setState(INTAKE); RR_setMotor3(auxIntakeSpeed()); } // intake while B held
+    if (btnX) setState(BUTTON);
+    if (btnY) setState(IDLE);
+
+    // Outtake (Motor3) on RB. Stop when neither RB nor B is held.
+    if (btnRB) {
+      RR_setMotor3(auxOuttakeSpeed());
+    } else if (!btnB) {
+      RR_setMotor3(0.0f);
+    }
+
+    // LB: toggle the button servo 0 <-> 180 on each press
+    static bool lbPrev = false;
+    if (btnLB && !lbPrev) {
+      btnServoHigh = !btnServoHigh;
+      btnServoCmd  = btnServoHigh ? 180 : 0;
+      writeButtonServo(btnServoCmd);
+    }
+    lbPrev = btnLB;
+  }
+
+  // -------- Telemetry --------
+  Serial.print("Mode=");
+  if (mode == MODE_STATIONARY) {
+    Serial.print("STATIONARY");
+  } else if (mode == MODE_AUTO) {
+    Serial.print("AUTO");
+  } else {
+    Serial.print("TELEOP");
   }
   Serial.print(" | State=");
   Serial.print((int)currentState);
@@ -250,5 +393,5 @@ void loop() {
   Serial.print(" | BtnServo=");
   Serial.println(btnServoCmd);
 
-  delay(5);
+  delay(5);  // keep loop snappy
 }

@@ -101,18 +101,16 @@ struct Pose {
   int elbow_internal_deg;  // internal angle between links (deg, 180 = straight)
 };
 
-enum ArmState { SCORE = 0, INTAKE = 1, BUTTON = 2, IDLE = 3, STATE_COUNT = 4 };
+enum ArmState { SCORE = 0, INTAKE = 1, STATE_COUNT = 2 };
 void setState(ArmState s);  // explicit prototype
 
 // >>> EDIT THESE ANGLES TO THE FIELD POSITIONS <<<
 Pose poses[STATE_COUNT] = {
   /* SCORE  (A) */ { 180, 120 },
   /* INTAKE (B) */ { 120,  90 },
-  /* BUTTON (X) */ {  60, 150 },
-  /* IDLE   (Y) */ {  90, 180 },
 };
 
-ArmState currentState     = IDLE;           // start idle
+ArmState currentState     = INTAKE;           // start in intake state
 ArmState lastAppliedState = (ArmState)(-1); // force initial apply
 
 // Compute new targets for the arm slewer
@@ -250,8 +248,8 @@ bool autoLineFollowStep() {
   RR_setMotor1(left);
   RR_setMotor2(right);
 
-  // Optional: keep the arm in a known pose during auto
-  setState(IDLE);  // or INTAKE/SCORE if you want
+  // Keep the arm in intake pose during auto
+  setState(INTAKE);
 
   return false; // keep going
 }
@@ -263,8 +261,8 @@ void setup() {
   // Initialize mode to STATIONARY - robot waits for LT or RT
   mode = MODE_STATIONARY;
   
-  // Initialize arm pose (idle)
-  setState(IDLE);
+  // Initialize arm pose (intake)
+  setState(INTAKE);
   applyCurrentPose(); // set initial targets & write once
 
   // Initialize button servo to 0°
@@ -320,14 +318,14 @@ void loop() {
     if (shouldStop) {
       // Press the button when we arrive (only once)
       if (!autoButtonPressed) {
-        setState(BUTTON);           // Move arm to button position
+        // Just press the button servo, arm stays in current pose
         btnServoHigh = true;        // Press button (180°)
         btnServoCmd  = 180;
         writeButtonServo(btnServoCmd);
         autoButtonPressed = true;   // Mark as pressed
       }
       RR_setMotor3(0.0f);        // stop intake/outtake
-      // stay in AUTO; driver can press RT/RB to enter teleop at any time
+      // stay in AUTO; driver can press RT to enter teleop at any time
     }
   } else {
     // =========== TELEOP ===========
@@ -347,16 +345,12 @@ void loop() {
     // -------- Buttons --------
     bool btnA  = RR_buttonA();   // SCORE
     bool btnB  = RR_buttonB();   // INTAKE
-    bool btnX  = RR_buttonX();   // BUTTON
-    bool btnY  = RR_buttonY();   // IDLE
     bool btnRB = RR_buttonRB();  // OUTTAKE
     bool btnLB = RR_buttonLB();  // TOGGLE button servo
 
     // Arm state selection (targets change; slewer handles motion)
     if (btnA) setState(SCORE);
     if (btnB) { setState(INTAKE); RR_setMotor3(auxIntakeSpeed()); } // intake while B held
-    if (btnX) setState(BUTTON);
-    if (btnY) setState(IDLE);
 
     // Outtake (Motor3) on RB. Stop when neither RB nor B is held.
     if (btnRB) {

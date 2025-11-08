@@ -17,7 +17,9 @@ const bool  INVERT_RIGHT = false;
 // ========================= Arm / servo calibration =========================
 static const int SHOULDER_SERVO_ID = 1; // RR_setServo1 -> shoulder
 static const int ELBOW_SERVO_ID    = 2; // RR_setServo2 -> elbow
+static const int BTN_SERVO_ID      = 3; // RR_setServo3 -> button servo (unique channel)
 
+// Offsets and reversals for shoulder/elbow (button servo uses raw 0/180)
 float SHOULDER_OFFSET_DEG = 0.0f;
 bool  SHOULDER_REVERSED   = false;
 
@@ -28,6 +30,13 @@ const int SHOULDER_MIN_DEG = 0;
 const int SHOULDER_MAX_DEG = 179;
 const int ELBOW_MIN_DEG    = 0;
 const int ELBOW_MAX_DEG    = 179;
+
+// ===== Slew parameters (non-blocking for arm) =====
+int curShoulderCmd = -1, curElbowCmd = -1;  // last written (0..180)
+int tgtShoulderCmd = -1, tgtElbowCmd = -1;  // targets (0..180)
+const int SERVO_STEP = 3;                   // deg per step
+const int SERVO_STEP_DELAY_MS = 8;          // ms between steps
+unsigned long lastServoStepMs = 0;
 
 // Convert elbow internal angle (between links) -> elbow joint bend
 static inline float elbowInternalToJointDeg(float internal_deg) {
@@ -58,6 +67,47 @@ static inline int applyOffsetReverseClamp(float joint_deg, float offset_deg, boo
   return clampi((int)lroundf(d), lo, hi);
 }
 
+static inline int stepToward(int cur, int target, int step) {
+  if (cur < 0) return target;                 // first write jumps to target
+  if (cur < target) return (cur + step > target) ? target : (cur + step);
+  if (cur > target) return (cur - step < target) ? target : (cur - step);
+  return cur;
+}
+
+// Low-level writes respecting channel mapping
+static inline void writeShoulder(int cmd) {
+  if (SHOULDER_SERVO_ID == 1) RR_setServo1(cmd);
+  else                        RR_setServo2(cmd);
+}
+static inline void writeElbow(int cmd) {
+  if (ELBOW_SERVO_ID == 2)    RR_setServo2(cmd);
+  else                        RR_setServo1(cmd);
+}
+static inline void writeButtonServo(int cmd) {
+  // Route to the selected button-servo channel
+  if (BTN_SERVO_ID == 1) RR_setServo1(cmd);
+  else if (BTN_SERVO_ID == 2) RR_setServo2(cmd);
+  else /* BTN_SERVO_ID == 3 */ RR_setServo3(cmd);
+}
+
+// Non-blocking arm servo slewing: call once per loop
+void serviceServosSlew() {
+  unsigned long now = millis();
+  if (now - lastServoStepMs < (unsigned long)SERVO_STEP_DELAY_MS) return;
+  lastServoStepMs = now;
+
+  if (tgtShoulderCmd < 0 && tgtElbowCmd < 0) return;
+
+  int newS = curShoulderCmd;
+  int newE = curElbowCmd;
+
+  if (tgtShoulderCmd >= 0) newS = stepToward(curShoulderCmd, tgtShoulderCmd, SERVO_STEP);
+  if (tgtElbowCmd    >= 0) newE = stepToward(curElbowCmd,    tgtElbowCmd,    SERVO_STEP);
+
+  if (newS != curShoulderCmd) { writeShoulder(newS); curShoulderCmd = newS; }
+  if (newE != curElbowCmd)    { writeElbow(newE);    curElbowCmd    = newE; }
+}
+
 // ========================= ARM STATES (FSM) =========================
 struct Pose {
   int shoulder_deg;        // absolute joint angle (deg)
@@ -75,29 +125,28 @@ Pose poses[STATE_COUNT] = {
   /* IDLE   (Y) */ {  90, 180 },
 };
 
-ArmState currentState     = IDLE;                 // start idle
-ArmState lastAppliedState = (ArmState)(-1);       // force initial apply
+ArmState currentState     = IDLE;           // start idle
+ArmState lastAppliedState = (ArmState)(-1); // force initial apply
 
+// Compute new targets for the arm slewer
 void applyCurrentPose() {
   const Pose &p = poses[(int)currentState];
 
-  // Shoulder
   int shoulder_cmd = applyOffsetReverseClamp(
       clampi(p.shoulder_deg, SHOULDER_MIN_DEG, SHOULDER_MAX_DEG),
       SHOULDER_OFFSET_DEG, SHOULDER_REVERSED, 0, 180);
 
-  // Elbow
   float elbow_joint_deg = elbowInternalToJointDeg((float)p.elbow_internal_deg);
   int elbow_cmd = applyOffsetReverseClamp(
       clampi((int)lroundf(elbow_joint_deg), ELBOW_MIN_DEG, ELBOW_MAX_DEG),
       ELBOW_OFFSET_DEG, ELBOW_REVERSED, 0, 180);
 
-  // Route to physical servo jacks
-  if (SHOULDER_SERVO_ID == 1) RR_setServo1(shoulder_cmd);
-  else                        RR_setServo2(shoulder_cmd);
+  tgtShoulderCmd = shoulder_cmd;
+  tgtElbowCmd    = elbow_cmd;
 
-  if (ELBOW_SERVO_ID == 2)    RR_setServo2(elbow_cmd);
-  else                        RR_setServo1(elbow_cmd);
+  // On first apply, jump to target immediately
+  if (curShoulderCmd < 0) { curShoulderCmd = tgtShoulderCmd; writeShoulder(curShoulderCmd); }
+  if (curElbowCmd    < 0) { curElbowCmd    = tgtElbowCmd;    writeElbow(curElbowCmd); }
 }
 
 void setState(ArmState s) {
@@ -109,17 +158,26 @@ void setState(ArmState s) {
 }
 
 // ========================= Intake/Outtake motor (Motor3) =========================
-// RB = intake, LB = outtake (hold-to-run)
 const bool  AUX_REVERSED   = false; // flip if directions are backwards
 const float AUX_BASE_SPEED = 1.0f;
 
 static inline float auxIntakeSpeed()  { return AUX_REVERSED ? -AUX_BASE_SPEED :  AUX_BASE_SPEED; }
 static inline float auxOuttakeSpeed() { return AUX_REVERSED ?  AUX_BASE_SPEED : -AUX_BASE_SPEED; }
 
+// ========================= Button Servo Toggle (LB) =========================
+// LB toggles the button servo 0° <-> 180° (with edge detection)
+bool btnServoHigh = false;   // false = 0°, true = 180°
+int  btnServoCmd  = 0;       // last commanded to the button servo
+
 // ========================= Setup / Loop =========================
 void setup() {
   Serial.begin(115200);
-  applyCurrentPose(); // go to idle pose at boot
+  applyCurrentPose();           // set initial arm targets & write once
+
+  // Initialize button servo to 0°
+  btnServoHigh = false;
+  btnServoCmd  = 0;
+  writeButtonServo(btnServoCmd);
 }
 
 void loop() {
@@ -144,23 +202,33 @@ void loop() {
   bool btnB  = RR_buttonB();   // INTAKE
   bool btnX  = RR_buttonX();   // BUTTON
   bool btnY  = RR_buttonY();   // IDLE
-  bool btnRB = RR_buttonRB();  // intake
-  bool btnLB = RR_buttonLB();  // outtake
+  bool btnRB = RR_buttonRB();  // OUTTAKE
+  bool btnLB = RR_buttonLB();  // TOGGLE button servo
 
-  // Arm state selection (instant jump)
+  // Arm state selection (targets change; slewer handles motion)
   if (btnA) setState(SCORE);
-  if (btnB) setState(INTAKE);
+  if (btnB) { setState(INTAKE); RR_setMotor3(auxIntakeSpeed()); } // intake while B held
   if (btnX) setState(BUTTON);
   if (btnY) setState(IDLE);
 
-  // Intake/Outtake (Motor3).
-  if (btnRB && !btnLB) {
-    RR_setMotor3(auxIntakeSpeed());
-  } else if (btnLB && !btnRB) {
+  // Outtake (Motor3) on RB. Stop when neither RB nor B is held.
+  if (btnRB) {
     RR_setMotor3(auxOuttakeSpeed());
-  } else {
+  } else if (!btnB) {
     RR_setMotor3(0.0f);
   }
+
+  // ---- LB: toggle the button servo between 0 and 180 on each press ----
+  static bool lbPrev = false;
+  if (btnLB && !lbPrev) {
+    btnServoHigh = !btnServoHigh;                 // flip state
+    btnServoCmd  = btnServoHigh ? 180 : 0;        // target angle
+    writeButtonServo(btnServoCmd);                // immediate write (no slew)
+  }
+  lbPrev = btnLB;
+
+  // -------- Slew the arm servos smoothly (non-blocking) --------
+  serviceServosSlew();
 
   // -------- Telemetry --------
   Serial.print("Ultrasonic=");
@@ -174,7 +242,13 @@ void loop() {
     Serial.print(" ");
   }
   Serial.print(" | State=");
-  Serial.println((int)currentState);
+  Serial.print((int)currentState);
+  Serial.print(" | CmdS/E=");
+  Serial.print(curShoulderCmd);
+  Serial.print("/");
+  Serial.print(curElbowCmd);
+  Serial.print(" | BtnServo=");
+  Serial.println(btnServoCmd);
 
-  delay(50);
+  delay(5);
 }
